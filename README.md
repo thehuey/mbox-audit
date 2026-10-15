@@ -6,8 +6,8 @@ Google Takeout gives you your whole mailbox as one large `.mbox` file. Before yo
 delete anything from Gmail, you want to know the export is complete and readable.
 `mbox_audit.py` reads the file once and tells you:
 
-- **How many messages it holds**, by month and by year (also saved as a CSV), so
-  you can spot missing months.
+- **How many messages it holds**, by month, by year and by Gmail label (also
+  saved as CSVs), so you can spot missing months and compare labels with Gmail.
 - **Whether the file is cut off or damaged.** It warns if the last message is
   incomplete (an interrupted download or unzip) or if a `.gz` copy is corrupt.
 - **Whether attachments come back intact.** It saves a random sample of messages
@@ -16,6 +16,9 @@ delete anything from Gmail, you want to know the export is complete and readable
   so you can compare.
 - **What is in a date range** (`--after` / `--before`): every message's time,
   sender and subject, plus the matching Gmail search, for spot checks.
+
+It can also **split** the export into smaller mailboxes: by year, month, Gmail
+label or size. Or it can write one complete mailbox for a single label.
 
 It is one Python file using only the standard library. It never changes the
 mbox or connects to the network.
@@ -86,13 +89,22 @@ By year:
   2023             5
   2024             5
 
+By label (a message can have several):
+  Inbox                                7
+  Finance                              2
+  ...
+
 Saving 6 random messages with attachments (Spam and Trash excluded) to mbox_audit_out/attachment_samples/
   01. [1 file(s)] Lease renewal
   02. [1 file(s)] Trip photos
   ...
 
-Done. Counts CSV: mbox_audit_out/counts_by_month.csv
+Done. Counts CSV: mbox_audit_out/counts_by_month.csv, mbox_audit_out/counts_by_label.csv
 ```
+
+The label table counts every label Gmail recorded, including markers like
+`Opened` and `Important`. A message with three labels is counted under each one,
+so the label counts add up to more than the total.
 
 Each sample folder in `mbox_audit_out/attachment_samples/` has:
 
@@ -109,8 +121,11 @@ Options:
 | `--out DIR` | output folder (default `mbox_audit_out`) |
 | `--seed N` | repeat the same random sample |
 | `--after WHEN`, `--before WHEN` | list messages in a date range instead of auditing (below) |
+| `--split HOW` | split into separate mailboxes instead of auditing: `year`, `month`, `label`, `size=2GB` (below) |
+| `--label NAME` | write every message with one Gmail label to its own mailbox (below) |
+| `--no-spam-trash` | with `--split` or `--label`: leave out Spam and Trash |
 
-A 20 GB mailbox takes about 3 minutes on a Mac.
+A 20 GB mailbox takes a few minutes on a Mac.
 
 ## 3. Spot-check a date range against Gmail
 
@@ -132,10 +147,83 @@ Gmail's settings first, so Gmail lists messages, not threads.
 Times are in your computer's time zone. `--after` includes its time and
 `--before` does not, as in Gmail. A time works too: `--after "2024-03-01 09:00"`.
 
+## 4. Split it into smaller mailboxes
+
+One 20 GB file is hard to work with: many mail apps import it slowly or not at
+all. `--split` copies each message, byte for byte, into a smaller mailbox. The
+files go in a new folder, so nothing lands next to your export, and the original
+is never changed.
+
+```sh
+python3 mbox_audit.py mail.mbox --split year            # 2023.mbox, 2024.mbox, ...
+python3 mbox_audit.py mail.mbox --split month           # 2024-02.mbox, 2024-03.mbox, ...
+python3 mbox_audit.py mail.mbox --split size=2GB        # part-001.mbox, part-002.mbox, ...
+python3 mbox_audit.py mail.mbox --split label           # Inbox.mbox, Work.mbox, ...
+python3 mbox_audit.py mail.mbox --split year --no-spam-trash --after 2015-01-01
+```
+
+Output from the demo mailbox:
+
+```
+Copied 10 of 10 messages into 7 files in mbox_audit_out/split_by_label/
+
+  File                                      Messages       Size
+  Family.mbox                                      1      0.0 MB
+  Finance.mbox                                     2      0.0 MB
+  Inbox.mbox                                       3      0.0 MB
+  ...
+```
+
+- Files go in `mbox_audit_out/split_by_<how>/`, with a `split_summary.csv`
+  listing each file's message count and size. If that folder already has files
+  in it, the tool stops rather than mixing old and new.
+- Years and months use your local time, as in Gmail. Messages with no readable
+  date go to `unknown.mbox`.
+- With `size=`, no message is cut in half. A message larger than the limit gets
+  a part of its own. Units are KB, MB and GB (1 GB = 1,000,000,000 bytes).
+  Joining the parts in order gives back the original file exactly.
+- `--after`, `--before` and `--no-spam-trash` limit which messages are copied.
+
+### Splitting by label
+
+Gmail lets a message have many labels, but each message goes into exactly
+**one** file, so nothing is duplicated:
+
+1. `Spam` or `Trash`
+2. otherwise your own label; a message with two or more of your labels goes to
+   `Multiple labels.mbox`
+3. otherwise `Sent`, `Drafts`, `Chat` or `Inbox`
+4. otherwise `Archived.mbox`
+
+Labels that only describe a message don't decide where it goes: `Opened`,
+`Unread`, `Important`, `Starred` and the `Category ...` tabs. Nested labels like
+`Work/Clients` become `Work - Clients.mbox`.
+
+`label_index.csv` in the same folder lists every label of every message: label,
+Gmail message ID, `Message-ID`, local date, and the file it's in. To see every
+message labelled Work, wherever it was filed:
+
+```sh
+grep '^Work,' mbox_audit_out/split_by_label/label_index.csv
+```
+
+To get **one complete mailbox for a label**, including messages that are also
+in other labels:
+
+```sh
+python3 mbox_audit.py mail.mbox --label Work           # -> mbox_audit_out/labels/Work.mbox
+```
+
+The label name isn't case-sensitive. It also takes `--no-spam-trash`,
+`--after` and `--before`, and it never overwrites an earlier export.
+
 ## Before you delete: a checklist
 
 - No `WARNING` lines in the report, and no samples with MIME problems.
 - The by-month table has no unexpected gaps.
+- The counts for labels you care about match Gmail. Search
+  `in:anywhere label:work` (or `label:work-clients` for `Work/Clients`), with
+  Conversation view off; `in:anywhere` includes Spam and Trash, as the export does.
 - The sample attachments open, and match the same messages in Gmail.
 - A few date ranges list the same messages as Gmail.
 - Keep two copies of the export, on different drives.
@@ -145,16 +233,16 @@ Times are in your computer's time zone. `--after` includes its time and
 - **Safety.** Samples are real mail, possibly including malware. The output folder
   is readable only by you, and on macOS saved files are flagged like web downloads
   so Gatekeeper checks them before they open.
-- **Dates.** Months and date ranges use each message's `Date:` header (the
-  sender's clock), falling back to the date on the mbox separator line. Gmail
-  sorts by when it received the message, so a message near a boundary can land on
-  the other side.
+- **Dates.** Months, years and date ranges use each message's `Date:` header,
+  shown in your local time, and fall back to the date on the mbox separator
+  line. Gmail sorts by when it received the message, so a message near a
+  boundary can land on the other side.
 - **Counts.** "Messages with attachments" is a quick header check
   (`Content-Disposition: attachment`) and doesn't count inline images.
 - **Memory.** The sampled messages are held in memory until the end: roughly
   `--samples` × message size.
-- **Input.** Give it the extracted `.mbox` or `.mbox.gz`. It can't read `.zip` or
-  `.tgz` archives or standard input; it tells you to extract a `.tgz` first.
+- **Input.** Give it the extracted `.mbox` or `.mbox.gz`. It can't read standard
+  input. Given a Takeout `.zip` or `.tgz`, it stops and tells you to extract it first.
 
 ## Running the tests
 

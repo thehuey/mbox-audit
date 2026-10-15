@@ -3,7 +3,7 @@
 mbox_audit.py - Verify a Gmail Takeout MBOX before deleting from Gmail.
 
   * Total message count
-  * Breakdown by year/month (printed + saved as CSV)
+  * Breakdown by year/month and by Gmail label (printed + saved as CSV)
   * Warns if the last message looks cut off (truncated download/extract)
   * Randomly samples N messages that have attachments (skipping Spam and
     Trash) and saves, for each:
@@ -27,11 +27,19 @@ List mode: --after/--before list the messages dated in that local-time range
 search that should show the same messages - for spot-checking before you
 delete. As in Gmail, --after is inclusive and --before is not.
 
+Split mode: --split copies the messages into separate mbox files in their own
+folder (by local year or month, by Gmail label, or into size-limited parts),
+and --label NAME writes every message with one label to a single mbox. Both
+honour --after/--before and --no-spam-trash. The original is never changed.
+
 Usage:
   python3 mbox_audit.py "All mail Including Spam and Trash.mbox"
   python3 mbox_audit.py mail.mbox.gz --samples 10 --out audit_out --seed 42
   python3 mbox_audit.py mail.mbox --after 2024-03-01 --before 2024-03-02
   python3 mbox_audit.py mail.mbox --after "2024-03-01 09:00" --before "2024-03-01 12:00"
+  python3 mbox_audit.py mail.mbox --split year --no-spam-trash
+  python3 mbox_audit.py mail.mbox --split size=2GB
+  python3 mbox_audit.py mail.mbox --label "Work/Clients"
 """
 import argparse
 import csv
@@ -44,10 +52,11 @@ import subprocess
 import sys
 import time
 import zlib
-from collections import Counter
+from collections import Counter, OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from email import policy
+from email.header import decode_header, make_header
 from email.parser import BytesHeaderParser, BytesParser
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -64,6 +73,13 @@ FROM_LINE_RE = re.compile(
 SPAM_TRASH = {"spam", "trash"}
 GZIP_MAGIC = b"\x1f\x8b"
 GZIP_ERRORS = (EOFError, gzip.BadGzipFile, zlib.error)  # cut-off or corrupt .gz
+# --split label: markers describe a message, they don't file it anywhere
+LABEL_MARKERS = {"opened", "unread", "important", "starred"}
+FOLDER_LABELS = ["Sent", "Drafts", "Chat", "Inbox"]  # used in this order
+SYSTEM_LABELS = LABEL_MARKERS | SPAM_TRASH | {l.lower() for l in FOLDER_LABELS} | {"archived"}
+GMAIL_ID_RE = re.compile(rb"From (\d+)@xxx ")  # Takeout: Gmail's message ID, in decimal
+SIZE_UNITS = {"KB": 10**3, "MB": 10**6, "GB": 10**9}
+MAX_OPEN_FILES = 64  # macOS often allows only 256 open files per process
 
 
 def damage_warning(e):
@@ -96,6 +112,22 @@ def is_tar(path):
             return f.read(262)[257:262] == b"ustar"
         except GZIP_ERRORS:
             return False  # reported as damage when the file is read
+
+
+def is_zip(path):
+    """True for a zip archive (e.g. a Takeout .zip)."""
+    with open(path, "rb") as f:
+        return f.read(4) in (b"PK\x03\x04", b"PK\x05\x06")
+
+
+def header_block(raw):
+    """The header lines of a raw message, up to the first blank line. The email
+    parser reads the whole body even when asked for headers only, so giving it
+    just this is much faster on messages with attachments."""
+    end = raw.find(b"\n\n")
+    crlf = raw.find(b"\n\r\n", 0, end if end >= 0 else len(raw))  # Windows line endings
+    end = crlf if crlf >= 0 else end
+    return raw[:end + 1] if end >= 0 else raw
 
 
 def iter_messages(f):
@@ -139,9 +171,21 @@ def message_time(hdrs, from_line):
     return None
 
 
+def month_of(when):
+    """'YYYY-MM' in local time (as Gmail shows it), or 'unknown'."""
+    return f"{when.astimezone():%Y-%m}" if when else "unknown"
+
+
 def year_month(hdrs, from_line):
-    dt = message_time(hdrs, from_line)
-    return f"{dt.year:04d}-{dt.month:02d}" if dt else "unknown"
+    return month_of(message_time(hdrs, from_line))
+
+
+def in_range(when, args):
+    """True if --after/--before are unset or the message time is in [after, before)."""
+    if not (args.after or args.before):
+        return True
+    return not (when is None or (args.after and when < args.after)
+                or (args.before and when >= args.before))
 
 
 def local_time(s):
@@ -155,6 +199,65 @@ def local_time(s):
 
 def gmail_labels(hdrs):
     return {l.strip().lower() for l in str(hdrs.get("X-Gmail-Labels", "")).split(",")}
+
+
+def label_names(hdrs):
+    """Gmail labels as named (case kept), decoding =?UTF-8?...?= label names."""
+    raw = str(hdrs.get("X-Gmail-Labels", ""))
+    try:
+        raw = str(make_header(decode_header(raw)))
+    except Exception:
+        pass
+    return [clean(l).strip() for l in raw.split(",") if l.strip()]
+
+
+def label_file(labels):
+    """The one label a message is filed under for --split label: Spam/Trash,
+    else your own label (or 'Multiple labels'), else Sent/Drafts/Chat/Inbox,
+    else Archived. Markers like Opened, Starred and Category ... don't count."""
+    low = {l.lower() for l in labels}
+    for name in ("Spam", "Trash"):
+        if name.lower() in low:
+            return name
+    own = list(dict.fromkeys(l for l in labels if l.lower() not in SYSTEM_LABELS
+                             and not l.lower().startswith("category ")))
+    if len(own) > 1:
+        return "Multiple labels"
+    if own:
+        return own[0]
+    return next((f for f in FOLDER_LABELS if f.lower() in low), "Archived")
+
+
+def split_mode(s):
+    """argparse type for --split: year, month, label or size=<N>KB|MB|GB."""
+    if s in ("year", "month", "label"):
+        return s, None
+    m = re.fullmatch(r"size=(\d+(?:\.\d+)?)\s*([KMG]B)", s.strip(), re.I)
+    if m and float(m[1]) > 0:
+        return "size", int(float(m[1]) * SIZE_UNITS[m[2].upper()])
+    raise argparse.ArgumentTypeError(f"{s!r}: use year, month, label or size=<N>MB|GB (e.g. size=2GB)")
+
+
+def mbox_entry(from_line, raw):
+    """A message as stored in an mbox: separator, message, then the blank line
+    that must precede the next separator (missing only after the file's last
+    message)."""
+    entry = from_line + raw
+    if not entry.endswith(b"\n"):
+        entry += b"\n"
+    if not entry.endswith((b"\n\n", b"\n\r\n")):
+        entry += b"\n"
+    return entry
+
+
+def csv_safe(s):
+    """Stop a spreadsheet from running untrusted text (e.g. a crafted
+    Message-ID) as a formula."""
+    return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
+
+
+def file_label(label):
+    return safe_name(label.replace("/", " - "), 100)
 
 
 def clean(s):
@@ -272,10 +375,9 @@ def list_messages(args):
     with open_mbox(args.mbox) as (f, _):
         try:
             for _, from_line, raw in iter_messages(f):
-                hdrs = hparser.parsebytes(raw)
+                hdrs = hparser.parsebytes(header_block(raw))
                 when = message_time(hdrs, from_line)
-                if (when is None or (args.after and when < args.after)
-                        or (args.before and when >= args.before)):
+                if when is None or not in_range(when, args):
                     continue
                 tags = sorted(gmail_labels(hdrs) & SPAM_TRASH)
                 spam_trash += bool(tags)
@@ -301,6 +403,172 @@ def list_messages(args):
         print("\n" + damage_warning(damage))
 
 
+class SplitWriter:
+    """Append messages to many mbox files in one folder, keeping at most
+    MAX_OPEN_FILES open at a time (the OS limits open files per process)."""
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.files = OrderedDict()  # name -> open file, least recently used first
+        self.counts, self.sizes = Counter(), Counter()
+
+    def write(self, name, data):
+        f = self.files.pop(name, None)
+        if f is None:
+            if len(self.files) >= MAX_OPEN_FILES:
+                self.files.popitem(last=False)[1].close()
+            f = open(self.folder / name, "ab" if name in self.counts else "xb")
+        self.files[name] = f
+        f.write(data)
+        self.counts[name] += 1
+        self.sizes[name] += len(data)
+
+    def close(self):
+        for f in self.files.values():
+            f.close()
+        self.files.clear()
+
+
+def selected(args, hdrs, when):
+    """Apply --no-spam-trash and --after/--before."""
+    if args.no_spam_trash and gmail_labels(hdrs) & SPAM_TRASH:
+        return False
+    return in_range(when, args)
+
+
+def split_mbox(args):
+    """Copy every selected message, byte for byte, into one mbox per year,
+    month, label or size-limited part, in a folder of its own."""
+    mode, limit = args.split
+    folder = args.out / f"split_by_{mode}"
+    if folder.exists() and any(folder.iterdir()):
+        sys.exit(f"{folder} is not empty - move it away or use another --out, "
+                 "so old and new files don't mix.")
+    folder.mkdir(parents=True, exist_ok=True)
+    folder.chmod(0o700)
+    hparser = BytesHeaderParser(policy=policy.compat32)
+    writer = SplitWriter(folder)
+    names, used = {}, set()  # label -> file name; names taken (case-insensitive disk)
+    part, part_size = 1, 0
+    total, skipped, damage = 0, 0, None
+    index_file = index = None
+    if mode == "label":
+        index_file = open(folder / "label_index.csv", "x", newline="", encoding="utf-8")
+        index = csv.writer(index_file)
+        index.writerow(["label", "gmail_id", "message_id", "date", "file"])
+    size = args.mbox.stat().st_size
+
+    def label_mbox(label):
+        if label not in names:
+            base = file_label(label)
+            name, n = f"{base}.mbox", 2
+            while name.lower() in used:
+                name, n = f"{base} ({n}).mbox", n + 1
+            used.add(name.lower())
+            names[label] = name
+        return names[label]
+
+    try:
+        with open_mbox(args.mbox) as (f, src):
+            try:
+                for _, from_line, raw in iter_messages(f):
+                    total += 1
+                    if total % 5000 == 0:
+                        print(f"  ...{total:,} messages ({src.tell() / size:.0%})", file=sys.stderr)
+                    hdrs = hparser.parsebytes(header_block(raw))
+                    when = message_time(hdrs, from_line)
+                    if not selected(args, hdrs, when):
+                        skipped += 1
+                        continue
+                    entry = mbox_entry(from_line, raw)
+                    if mode == "year":
+                        name = f"{month_of(when).split('-')[0]}.mbox"
+                    elif mode == "month":
+                        name = f"{month_of(when)}.mbox"
+                    elif mode == "size":
+                        if part_size and part_size + len(entry) > limit:
+                            part, part_size = part + 1, 0
+                        part_size += len(entry)
+                        name = f"part-{part:03d}.mbox"
+                    else:
+                        labels = label_names(hdrs)
+                        name = label_mbox(label_file(labels))
+                        m = GMAIL_ID_RE.match(from_line)
+                        row = [m[1].decode() if m else "",
+                               csv_safe(header_text(hdrs, "Message-ID").strip()),
+                               f"{when.astimezone():%Y-%m-%d %H:%M}" if when else "", name]
+                        for label in labels or ["(none)"]:
+                            index.writerow([csv_safe(label), *row])
+                    writer.write(name, entry)
+            except GZIP_ERRORS as e:
+                damage = e
+    finally:
+        writer.close()
+        if index_file:
+            index_file.close()
+
+    with open(folder / "split_summary.csv", "x", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["file", "messages", "bytes"])
+        for name in sorted(writer.counts):
+            w.writerow([name, writer.counts[name], writer.sizes[name]])
+
+    written = sum(writer.counts.values())
+    files = len(writer.counts)
+    print(f"Copied {written:,} of {total:,} messages into {files:,} file{'s' * (files != 1)} "
+          f"in {folder}/")
+    if skipped:
+        print(f"({skipped:,} left out by --after/--before/--no-spam-trash)")
+    print(f"\n  {'File':<40} {'Messages':>9} {'Size':>10}")
+    for name in sorted(writer.counts):
+        over = "  (one message over the limit)" if mode == "size" and writer.sizes[name] > limit else ""
+        print(f"  {name:<40} {writer.counts[name]:>9,} {writer.sizes[name] / 1e6:>8.1f} MB{over}")
+    if mode == "label":
+        print("\nEach message is in exactly one file. label_index.csv lists every label of "
+              "every message;\nuse --label NAME for one complete label mailbox.")
+    print(f"\nSummary: {folder / 'split_summary.csv'}")
+    if damage:
+        print("\n" + damage_warning(damage))
+
+
+def extract_label(args):
+    """Write every selected message that carries the label --label NAME to
+    <out>/labels/NAME.mbox (case-insensitive match), in one read."""
+    want = args.label.strip().lower()
+    path = args.out / "labels" / f"{file_label(args.label)}.mbox"
+    if path.exists():
+        sys.exit(f"{path} already exists - move it away or use another --out.")
+    hparser = BytesHeaderParser(policy=policy.compat32)
+    count, damage, out = 0, None, None
+    try:
+        with open_mbox(args.mbox) as (f, _):
+            try:
+                for _, from_line, raw in iter_messages(f):
+                    hdrs = hparser.parsebytes(header_block(raw))
+                    if want not in {l.lower() for l in label_names(hdrs)}:
+                        continue
+                    if not selected(args, hdrs, message_time(hdrs, from_line)):
+                        continue
+                    if out is None:
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.parent.chmod(0o700)
+                        out = open(path, "xb")
+                    out.write(mbox_entry(from_line, raw))
+                    count += 1
+            except GZIP_ERRORS as e:
+                damage = e
+    finally:
+        if out:
+            out.close()
+    if damage:
+        print(damage_warning(damage) + "\n")
+    if not count:
+        sys.exit(f"No messages with the label {clean(args.label)!r}"
+                 + (" match --after/--before/--no-spam-trash." if args.after or args.before
+                    or args.no_spam_trash else "."))
+    print(f"Wrote {count:,} messages with the label {clean(args.label)!r} to {path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -310,19 +578,38 @@ def main():
     ap.add_argument("--seed", type=int, default=None, help="for a repeatable sample")
     ap.add_argument("--after", type=local_time, metavar="WHEN",
                     help="list messages dated at or after this local time instead of "
-                         "auditing: YYYY-MM-DD or 'YYYY-MM-DD HH:MM' (like Gmail's after:)")
+                         "auditing: YYYY-MM-DD or 'YYYY-MM-DD HH:MM' (like Gmail's after:); "
+                         "with --split/--label, only copy those messages")
     ap.add_argument("--before", type=local_time, metavar="WHEN",
                     help="list messages dated before this local time (like Gmail's before:)")
+    ap.add_argument("--split", type=split_mode, metavar="HOW",
+                    help="copy the messages into separate mbox files instead of auditing: "
+                         "year, month, label, or size=<N>MB|GB (e.g. size=2GB)")
+    ap.add_argument("--label", metavar="NAME",
+                    help="write every message with this Gmail label to one mbox")
+    ap.add_argument("--no-spam-trash", action="store_true",
+                    help="with --split or --label: leave out Spam and Trash")
     args = ap.parse_args()
     if args.after and args.before and args.after >= args.before:
         ap.error("--after must be earlier than --before")
+    if args.split and args.label:
+        ap.error("use --split or --label, not both")
+    if args.no_spam_trash and not (args.split or args.label):
+        ap.error("--no-spam-trash works only with --split or --label")
 
     if not args.mbox.is_file():
         sys.exit(f"Not found: {args.mbox}")
+    if is_zip(args.mbox):
+        sys.exit(f"{args.mbox} is a zip archive (e.g. a Takeout .zip), not an mbox.\n"
+                 "Extract it first (unzip <file>, or double-click it in Finder) "
+                 "and run this on the .mbox inside.")
     if is_tar(args.mbox):
         sys.exit(f"{args.mbox} is a tar archive (e.g. a Takeout .tgz), not an mbox.\n"
                  f"Extract it first (tar -xzf <file>, or tar -xf if not gzipped) "
                  "and run this on the .mbox inside.")
+    if args.split or args.label:
+        os.umask(0o077)  # copied mail is private: files 0600, folders 0700
+        return split_mbox(args) if args.split else extract_label(args)
     if args.after or args.before:
         return list_messages(args)
     os.umask(0o077)  # extracted mail is private: files 0600, folders 0700
@@ -330,7 +617,7 @@ def main():
     hparser = BytesHeaderParser(policy=policy.compat32)
 
     total, with_attach, pool = 0, 0, 0
-    by_month = Counter()
+    by_month, by_label = Counter(), Counter()
     # Reservoir sampling: a uniform random sample in one pass without knowing
     # the message count. Holds (offset, raw) of at most --samples messages.
     reservoir = []
@@ -343,8 +630,9 @@ def main():
         try:
             for offset, from_line, raw in iter_messages(f):
                 total += 1
-                hdrs = hparser.parsebytes(raw)
+                hdrs = hparser.parsebytes(header_block(raw))
                 by_month[year_month(hdrs, from_line)] += 1
+                by_label.update(set(label_names(hdrs) or ["(none)"]))
                 if ATTACH_RE.search(raw):
                     with_attach += 1
                     if not gmail_labels(hdrs) & SPAM_TRASH:
@@ -381,10 +669,16 @@ def main():
     years = Counter()
     for ym in sorted(by_month):
         print(f"  {ym:<10} {by_month[ym]:>7,}")
-        years[ym[:4]] += by_month[ym]
+        years[ym.split("-")[0]] += by_month[ym]
     print("\nBy year:")
     for y in sorted(years):
         print(f"  {y:<10} {years[y]:>7,}")
+
+    labels = sorted(by_label, key=lambda l: (-by_label[l], l.lower()))
+    if labels:
+        print("\nBy label (a message can have several):")
+        for label in labels:
+            print(f"  {label:<30} {by_label[label]:>7,}")
 
     with open(args.out / "counts_by_month.csv", "w", newline="") as f:
         w = csv.writer(f)
@@ -392,6 +686,11 @@ def main():
         for ym in sorted(by_month):
             w.writerow([ym, by_month[ym]])
         w.writerow(["TOTAL", total])
+    with open(args.out / "counts_by_label.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["label", "count"])
+        for label in labels:
+            w.writerow([csv_safe(label), by_label[label]])
 
     # Save the sampled messages, numbered in mailbox order
     if reservoir:
@@ -409,7 +708,8 @@ def main():
         if damaged:
             print(f"\n{damaged} of {len(reservoir)} samples have MIME problems - "
                   "compare them with the same messages in Gmail.")
-    print(f"\nDone. Counts CSV: {args.out / 'counts_by_month.csv'}")
+    print(f"\nDone. Counts CSV: {args.out / 'counts_by_month.csv'}, "
+          f"{args.out / 'counts_by_label.csv'}")
 
 
 if __name__ == "__main__":

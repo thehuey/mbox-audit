@@ -1,6 +1,7 @@
 """Tests for mbox_audit.py.  Run from this folder:  python3 -m unittest -v"""
 import base64
 import contextlib
+import csv
 import gzip
 import io
 import itertools
@@ -12,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -42,11 +44,12 @@ def multipart(subtype, *parts):
 
 
 def message(entity, subject=b"Test", labels=b"Inbox",
-            date=b"Mon, 01 Jan 2024 10:00:00 +0000", sender=b"a@example.com"):
+            date=b"Mon, 01 Jan 2024 10:00:00 +0000", sender=b"a@example.com",
+            msgid=b"<test@example.com>"):
     return (b"From: " + sender + b"\nTo: b@example.com\n"
             + (b"Date: " + date + b"\n" if date else b"")
             + b"Subject: " + subject + b"\n"
-            b"Message-ID: <test@example.com>\nX-Gmail-Labels: " + labels + b"\n"
+            b"Message-ID: " + msgid + b"\nX-Gmail-Labels: " + labels + b"\n"
             b"MIME-Version: 1.0\n" + entity)
 
 
@@ -163,7 +166,8 @@ class MainTest(unittest.TestCase):
         path = self.tmp / "test.mbox"
         path.write_bytes(data)
         r = subprocess.run([sys.executable, str(SCRIPT), str(path), "--out", str(self.out),
-                            "--samples", "10"], capture_output=True, check=True)
+                            "--samples", "10"], capture_output=True, check=True,
+                           env={**os.environ, "TZ": "America/Los_Angeles"})
         self.err = r.stderr.decode("utf-8", "replace")
         return r.stdout.decode("utf-8", "replace")
 
@@ -206,11 +210,47 @@ class MainTest(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn(b"tar -xzf", r.stderr)
 
+    def test_refuses_zip_archive_with_unzip_hint(self):
+        path = self.tmp / "takeout.zip"
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("Takeout/Mail/All mail Including Spam and Trash.mbox", mbox(with_pdf()))
+        for extra in ([], ["--split", "year"]):
+            r = subprocess.run([sys.executable, str(SCRIPT), str(path), "--out", str(self.out), *extra],
+                               capture_output=True)
+            self.assertNotEqual(r.returncode, 0, extra)
+            self.assertIn(b"unzip", r.stderr)
+        self.assertFalse(self.out.exists())
+
+    def test_reports_message_count_per_label(self):
+        out = self.run_audit(mbox(with_pdf(labels=b"Inbox,Work,Opened"),
+                                  message(text(), labels=b"Work,Family"),
+                                  message(text(), labels=b"Spam")))
+        table = out.split("By label")[1]
+        self.assertRegex(table, r"\n  Work\s+2\n")
+        self.assertRegex(table, r"\n  Spam\s+1\n")
+        self.assertRegex(table, r"\n  Opened\s+1\n")
+        with open(self.out / "counts_by_label.csv", newline="") as f:
+            self.assertIn({"label": "Family", "count": "1"}, list(csv.DictReader(f)))
+
+    def test_encoded_label_names_are_decoded_in_label_counts(self):
+        out = self.run_audit(mbox(message(text(), labels=b"=?UTF-8?Q?Caf=C3=A9?=")))
+        self.assertRegex(out.split("By label")[1], "\n  Café\\s+1\n")
+
     def test_month_table_uses_date_header_then_separator_date(self):
         out = self.run_audit(mbox(message(text(), date=b"Fri, 15 Mar 2024 10:00:00 +0000"),
-                                  message(text(), date=None)))  # SEP says Jan 2024
-        self.assertRegex(out, r"2024-01\s+1\n")
+                                  message(text(), date=None)))  # SEP: 2024-01-01 00:00 UTC
+        self.assertRegex(out, r"2023-12\s+1\n")  # = 2023-12-31 16:00 PST
         self.assertRegex(out, r"2024-03\s+1\n")
+
+    def test_month_table_uses_local_time(self):
+        # 2024-03-01 07:00 UTC is still February 29 in Los Angeles
+        out = self.run_audit(mbox(message(text(), date=b"Fri, 01 Mar 2024 07:00:00 +0000")))
+        self.assertRegex(out, r"2024-02\s+1\n")
+
+    def test_undated_messages_are_shown_as_unknown_in_year_table(self):
+        bad_sep = b"From MAILER-DAEMON Fri Feb 30 00:00:00 2024\n"  # no such day
+        out = self.run_audit(bad_sep + message(text(), date=b"garbage"))
+        self.assertIn("unknown", out.split("By year:")[1])
 
     def test_progress_on_gzipped_mbox_never_exceeds_100_percent(self):
         self.run_audit(gzip.compress(mbox(*[message(text())] * 5000)))
@@ -302,6 +342,224 @@ class ReadOnceTest(unittest.TestCase):
         size = path.stat().st_size
         self.assertLess(CountingFileIO.total, size * 1.1,
                         f"read {CountingFileIO.total / size:.2f}x the file size")
+
+
+def dated(subject, date, labels=b"Inbox", msgid=None):
+    return message(text(), subject=subject, date=date, labels=labels,
+                   msgid=msgid or b"<" + subject + b"@example.com>")
+
+
+# One message per label rule; subject -> the only file it should land in
+LABELLED = [
+    (b"InboxOnly", b"Inbox,Category Updates,Important,Opened", "Inbox.mbox"),
+    (b"OneLabel", b"Inbox,Work,Opened", "Work.mbox"),
+    (b"TwoLabels", b"Work,Family,Starred", "Multiple labels.mbox"),
+    (b"Junk", b"Spam,Work", "Spam.mbox"),
+    (b"Binned", b"Trash,Opened", "Trash.mbox"),
+    (b"Outgoing", b"Sent,Opened", "Sent.mbox"),
+    (b"Old", b"Archived,Category Promotions,Unread", "Archived.mbox"),
+    (b"Nested", b"Archived,Work/Clients", "Work - Clients.mbox"),
+]
+LABELLED_MBOX = mbox(*(dated(s, b"Mon, 01 Jan 2024 10:00:00 +0000", labels)
+                       for s, labels, _ in LABELLED))
+
+
+class SplitTest(unittest.TestCase):
+    """--split year|month|label|size=N, and --label NAME."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.out = self.tmp / "out"
+
+    def run_tool(self, data, *args):
+        self.path = self.tmp / "mail.mbox"
+        self.path.write_bytes(data)
+        r = subprocess.run([sys.executable, str(SCRIPT), str(self.path), "--out", str(self.out), *args],
+                           capture_output=True, env={**os.environ, "TZ": "America/Los_Angeles"})
+        self.code, self.err = r.returncode, r.stderr.decode("utf-8", "replace")
+        return r.stdout.decode("utf-8", "replace")
+
+    def folder(self, mode):
+        return self.out / f"split_by_{mode}"
+
+    def mboxes(self, mode):
+        return sorted(p.name for p in self.folder(mode).glob("*.mbox"))
+
+    def subjects(self, path):
+        return re.findall(rb"^Subject: (.*)$", path.read_bytes(), re.M)
+
+    def test_split_by_year_writes_one_mbox_per_year_in_its_own_folder(self):
+        data = mbox(dated(b"A22", b"Sat, 01 Jan 2022 12:00:00 -0800"),
+                    dated(b"B23", b"Mon, 06 Mar 2023 12:00:00 -0800"),
+                    dated(b"C23", b"Fri, 01 Dec 2023 12:00:00 -0800"))
+        self.run_tool(data, "--split", "year")
+        self.assertEqual(self.code, 0, self.err)
+        self.assertEqual(self.mboxes("year"), ["2022.mbox", "2023.mbox"])
+        self.assertEqual(self.subjects(self.folder("year") / "2023.mbox"), [b"B23", b"C23"])
+        self.assertEqual(self.path.read_bytes(), data)  # original untouched
+
+    def test_split_summary_counts_messages_and_bytes(self):
+        data = mbox(dated(b"A22", b"Sat, 01 Jan 2022 12:00:00 -0800"),
+                    dated(b"B23", b"Mon, 06 Mar 2023 12:00:00 -0800"),
+                    dated(b"C23", b"Fri, 01 Dec 2023 12:00:00 -0800"))
+        self.run_tool(data, "--split", "year")
+        with open(self.folder("year") / "split_summary.csv", newline="") as f:
+            rows = {r["file"]: r for r in csv.DictReader(f)}
+        self.assertEqual(rows["2023.mbox"]["messages"], "2")
+        self.assertEqual(int(rows["2023.mbox"]["bytes"]),
+                         (self.folder("year") / "2023.mbox").stat().st_size)
+
+    def test_split_by_month_uses_local_time_and_keeps_year(self):
+        # 2024-03-01 07:00 UTC is 2024-02-29 23:00 in Los Angeles
+        self.run_tool(mbox(dated(b"Leap", b"Fri, 01 Mar 2024 07:00:00 +0000")), "--split", "month")
+        self.assertEqual(self.mboxes("month"), ["2024-02.mbox"])
+
+    def test_undated_messages_go_to_unknown(self):
+        bad_sep = b"From MAILER-DAEMON Fri Feb 30 00:00:00 2024\n"  # no such day
+        self.run_tool(bad_sep + message(text(), subject=b"NoDate", date=b"garbage"), "--split", "year")
+        self.assertEqual(self.subjects(self.folder("year") / "unknown.mbox"), [b"NoDate"])
+
+    def test_split_copies_messages_byte_for_byte(self):
+        data = mbox(with_pdf(subject=b"P1"), dated(b"P2", b"Mon, 06 Mar 2023 12:00:00 -0800"))
+        self.run_tool(data, "--split", "size=1GB")
+        self.assertEqual((self.folder("size") / "part-001.mbox").read_bytes(), data)
+
+    def test_split_by_size_never_cuts_a_message(self):
+        subjects = [b"M%d" % i for i in range(10)]
+        data = mbox(*(dated(s, b"Mon, 06 Mar 2023 12:00:00 -0800") for s in subjects))
+        self.run_tool(data, "--split", "size=1KB")
+        parts = [self.folder("size") / n for n in self.mboxes("size")]
+        self.assertGreater(len(parts), 1)
+        for p in parts:
+            self.assertLessEqual(p.stat().st_size, 1000, p.name)
+        self.assertEqual([s for p in parts for s in self.subjects(p)], subjects)
+        self.assertEqual(b"".join(p.read_bytes() for p in parts), data)
+
+    def test_message_bigger_than_size_limit_gets_its_own_part(self):
+        big = message(text(b"x" * 3000), subject=b"Big")
+        data = mbox(dated(b"S1", b"Mon, 06 Mar 2023 12:00:00 -0800"), big,
+                    dated(b"S2", b"Mon, 06 Mar 2023 12:00:00 -0800"))
+        self.run_tool(data, "--split", "size=1KB")
+        parts = [self.subjects(self.folder("size") / n) for n in self.mboxes("size")]
+        self.assertEqual(parts, [[b"S1"], [b"Big"], [b"S2"]])
+
+    def test_split_by_label_files_each_message_once_by_priority(self):
+        self.run_tool(LABELLED_MBOX, "--split", "label")
+        self.assertEqual(self.code, 0, self.err)
+        self.assertEqual(self.mboxes("label"), sorted(f for _, _, f in LABELLED))
+        for subject, _, fname in LABELLED:
+            self.assertEqual(self.subjects(self.folder("label") / fname), [subject], fname)
+
+    def test_label_index_lists_every_label_of_every_message(self):
+        self.run_tool(LABELLED_MBOX, "--split", "label")
+        with open(self.folder("label") / "label_index.csv", newline="") as f:
+            rows = list(csv.DictReader(f))
+        work = {r["message_id"]: r["file"] for r in rows if r["label"] == "Work"}
+        self.assertEqual(work, {"<OneLabel@example.com>": "Work.mbox",
+                                "<TwoLabels@example.com>": "Multiple labels.mbox",
+                                "<Junk@example.com>": "Spam.mbox"})
+        starred = [r for r in rows if r["label"] == "Starred"]
+        self.assertEqual([r["message_id"] for r in starred], ["<TwoLabels@example.com>"])
+        self.assertEqual(starred[0]["gmail_id"], "1700000000000000001")
+        self.assertEqual(starred[0]["date"], "2024-01-01 02:00")  # local time
+
+    def test_index_cells_cannot_run_as_spreadsheet_formulas(self):
+        evil = dated(b"Evil", b"Mon, 01 Jan 2024 10:00:00 +0000", msgid=b'=HYPERLINK("http://x")')
+        self.run_tool(mbox(evil), "--split", "label")
+        with open(self.folder("label") / "label_index.csv", newline="") as f:
+            (row,) = csv.DictReader(f)
+        self.assertFalse(row["message_id"].startswith("="), row["message_id"])
+        self.assertIn("HYPERLINK", row["message_id"])
+
+    def test_header_lookalike_in_body_is_ignored(self):
+        body = text(b"Forwarded:\n\nX-Gmail-Labels: Spam\nDate: Sat, 01 Jan 2000 00:00:00 +0000")
+        self.run_tool(mbox(message(body, subject=b"Real", labels=b"Work")), "--split", "label")
+        self.assertEqual(self.mboxes("label"), ["Work.mbox"])
+
+    def test_crlf_messages_are_read(self):
+        crlf = dated(b"Windows", b"Mon, 06 Mar 2023 12:00:00 -0800", labels=b"Work").replace(b"\n", b"\r\n")
+        self.run_tool(SEP + crlf + b"\r\n", "--split", "label")
+        self.assertEqual(self.mboxes("label"), ["Work.mbox"])
+
+    def test_message_without_body_is_read(self):
+        bare = b"From: a@example.com\nSubject: Bare\nX-Gmail-Labels: Work\n"
+        self.run_tool(mbox(bare), "--split", "label")
+        self.assertEqual(self.mboxes("label"), ["Work.mbox"])
+
+    def test_refuses_to_write_into_non_empty_split_folder(self):
+        self.folder("year").mkdir(parents=True)
+        (self.folder("year") / "2023.mbox").write_bytes(b"older split")
+        self.run_tool(mbox(dated(b"B23", b"Mon, 06 Mar 2023 12:00:00 -0800")), "--split", "year")
+        self.assertNotEqual(self.code, 0)
+        self.assertIn("not empty", self.err)
+        self.assertEqual((self.folder("year") / "2023.mbox").read_bytes(), b"older split")
+
+    def test_split_honours_date_range_and_no_spam_trash(self):
+        data = mbox(dated(b"Old", b"Sat, 01 Jan 2022 12:00:00 -0800"),
+                    dated(b"Keep", b"Mon, 06 Mar 2023 12:00:00 -0800"),
+                    dated(b"Junk", b"Mon, 06 Mar 2023 13:00:00 -0800", labels=b"Spam"))
+        self.run_tool(data, "--split", "year", "--after", "2023-01-01", "--no-spam-trash")
+        self.assertEqual(self.mboxes("year"), ["2023.mbox"])
+        self.assertEqual(self.subjects(self.folder("year") / "2023.mbox"), [b"Keep"])
+
+    def test_split_reads_gzipped_mbox(self):
+        self.run_tool(gzip.compress(mbox(dated(b"B23", b"Mon, 06 Mar 2023 12:00:00 -0800"))),
+                      "--split", "year")
+        self.assertEqual(self.subjects(self.folder("year") / "2023.mbox"), [b"B23"])
+
+    def test_split_into_more_files_than_can_be_open_at_once(self):
+        months = [f"15 {m} {y} 12:00:00 -0800".encode()
+                  for y in range(2015, 2021) for m in ("Jan Feb Mar Apr May Jun Jul Aug Sep "
+                                                       "Oct Nov Dec").split()][:70]
+        rounds = [dated(b"R%d-%d" % (r, i), d) for r in (1, 2) for i, d in enumerate(months)]
+        self.run_tool(mbox(*rounds), "--split", "month")
+        self.assertEqual(self.code, 0, self.err)
+        self.assertEqual(len(self.mboxes("month")), 70)
+        self.assertEqual(self.subjects(self.folder("month") / "2020-10.mbox"), [b"R1-69", b"R2-69"])
+
+    def test_split_output_is_private(self):
+        self.run_tool(LABELLED_MBOX, "--split", "label")
+        for p in [self.folder("label"), *self.folder("label").iterdir()]:
+            self.assertEqual(stat.S_IMODE(p.stat().st_mode) & 0o077, 0, f"{p} readable by others")
+
+    def test_label_option_writes_complete_label_mailbox(self):
+        self.run_tool(LABELLED_MBOX, "--label", "work")
+        self.assertEqual(self.code, 0, self.err)
+        self.assertEqual(self.subjects(self.out / "labels" / "work.mbox"),
+                         [b"OneLabel", b"TwoLabels", b"Junk"])
+
+    def test_label_option_can_skip_spam_and_trash(self):
+        self.run_tool(LABELLED_MBOX, "--label", "Work", "--no-spam-trash")
+        self.assertEqual(self.subjects(self.out / "labels" / "Work.mbox"), [b"OneLabel", b"TwoLabels"])
+
+    def test_label_option_refuses_to_overwrite(self):
+        (self.out / "labels").mkdir(parents=True)
+        (self.out / "labels" / "Work.mbox").write_bytes(b"earlier export")
+        self.run_tool(LABELLED_MBOX, "--label", "Work")
+        self.assertNotEqual(self.code, 0)
+        self.assertEqual((self.out / "labels" / "Work.mbox").read_bytes(), b"earlier export")
+
+    def test_unknown_label_fails_and_writes_nothing(self):
+        self.run_tool(LABELLED_MBOX, "--label", "Nope")
+        self.assertNotEqual(self.code, 0)
+        self.assertIn("No messages", self.err)
+        self.assertFalse((self.out / "labels" / "Nope.mbox").exists())
+
+    def test_rejects_unknown_split_mode(self):
+        self.run_tool(LABELLED_MBOX, "--split", "weekly")
+        self.assertNotEqual(self.code, 0)
+        self.assertIn("size=", self.err)
+
+    def test_split_and_label_cannot_be_combined(self):
+        self.run_tool(LABELLED_MBOX, "--split", "year", "--label", "Work")
+        self.assertNotEqual(self.code, 0)
+
+    def test_no_spam_trash_needs_split_or_label(self):
+        self.run_tool(LABELLED_MBOX, "--no-spam-trash")
+        self.assertNotEqual(self.code, 0)
+        self.assertIn("--no-spam-trash", self.err)
 
 
 class ListTest(unittest.TestCase):
