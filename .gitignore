@@ -1,0 +1,19 @@
+# Audit output: extracted private mail
+mbox_audit_out/
+audit_out/
+attachment_samples/
+counts_by_month.csv
+
+# Mail exports
+*.mbox
+*.mbox.gz
+*.mbx
+*.eml
+*.tgz
+*.zip
+Takeout/
+
+# Python, macOS
+__pycache__/
+*.pyc
+.DS_Store
